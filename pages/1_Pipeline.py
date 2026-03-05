@@ -2,7 +2,6 @@
 
 import streamlit as st
 import sys, os, time, tempfile, json
-
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "server"))
 from api import (
     aggregate_biomarkers, generate_gemini_report, build_complete_report,
@@ -16,13 +15,13 @@ try:
 except ImportError:
     YOLO_AVAILABLE = False
     def load_models(): return False
-    def process_video(path, target_fps=10.0, output_video_path=None): return [], None
+    def process_video(path, target_fps=10.0, output_video_path=None, frame_callback=None): return [], None
     def is_loaded(): return False
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from charts import (
     entropy_chart, fluency_chart, fractal_chart, phase_space_chart,
-    kinetic_energy_chart, symmetry_chart, confidence_timeline, confidence_gauge,
+    kinetic_energy_chart, symmetry_chart, confidence_timeline,
 )
 
 # --- Page Header ---
@@ -102,6 +101,8 @@ if not YOLO_AVAILABLE or not is_loaded():
 can_run = uploaded is not None and YOLO_AVAILABLE and is_loaded()
 
 if st.button("Run Clinical Analysis", disabled=not can_run, type="primary", use_container_width=True):
+    assert uploaded is not None  # guaranteed by can_run check above
+    annotated_path: str | None = None
     # Save uploaded file to temp
     with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(uploaded.name)[1]) as tmp:
         tmp.write(uploaded.getvalue())
@@ -227,7 +228,7 @@ Return ONLY a JSON object with the new MotionConfig parameters."""
     finally:
         if os.path.exists(temp_path):
             os.remove(temp_path)
-        if "annotated_path" in dir() and annotated_path and os.path.exists(annotated_path):
+        if annotated_path and os.path.exists(annotated_path):
             os.remove(annotated_path)
 
 # --- Show Charts (if data exists) ---
