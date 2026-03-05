@@ -1,7 +1,15 @@
 """Pipeline page — video upload → YOLO → physics → Gemini → report."""
 
+from __future__ import annotations
+
 import streamlit as st
 import sys, os, time, tempfile, json
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from typing import Any, Callable
+    import numpy as np
+    from numpy.typing import NDArray
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "server"))
 from api import (
     aggregate_biomarkers, generate_gemini_report, build_complete_report,
@@ -14,9 +22,13 @@ try:
     YOLO_AVAILABLE = True
 except ImportError:
     YOLO_AVAILABLE = False
-    def load_models(): return False
-    def process_video(path, target_fps=10.0, output_video_path=None, frame_callback=None): return [], None
-    def is_loaded(): return False
+    def load_models() -> bool: return False
+    def process_video(
+        video_path: str, target_fps: float = 10.0, det_score_threshold: float = 0.5,
+        output_video_path: str | None = None,
+        frame_callback: Callable[[NDArray[Any], int, int], None] | None = None,
+    ) -> tuple[list[dict[str, Any]], str | None]: return [], None
+    def is_loaded() -> bool: return False
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from charts import (
@@ -214,6 +226,8 @@ Return ONLY a JSON object with the new MotionConfig parameters."""
                             model='gemini-3-pro-preview', contents=refine_prompt,
                             config=types.GenerateContentConfig(response_mime_type='application/json'),
                         )
+                        if not resp.text:
+                            raise ValueError("Empty response from Gemini")
                         new_config = _json.loads(resp.text)
                         st.write("**Before:**", config)
                         st.write("**After:**", new_config)
