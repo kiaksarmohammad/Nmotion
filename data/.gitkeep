@@ -1,0 +1,14 @@
+# Drop CSVs here following the naming convention:
+#
+#   neuromotion_{category}_{subject_id}_{recording_id}.csv
+#
+# Supported categories:
+#   n1       → Normal label 0
+#   n2       → Normal label 0
+#   spasms4  → Spasms label 1
+#   spasms5  → Spasms label 1
+#   hyper6   → Hypertonia label 2
+#
+# Each CSV must have columns matching BIOMARKER_NAMES in config.py
+# (entropy, fractal_dim, kinetic_energy, root_stress, phase_x, phase_v,
+#  mean_velocity, peak_frequency, angular_jerk) plus a 'timestamp' column.
