@@ -1,0 +1,16 @@
+# Optical flow
+torch>=2.4.0
+torchvision>=0.19.0
+
+# Feature extraction
+antropy>=0.2.0
+scipy>=1.10.0
+numpy>=1.24.0
+pandas>=2.0.0
+scikit-learn>=1.4.0
+
+# Visualization
+matplotlib>=3.8.0
+
+# Video I/O
+opencv-python-headless>=4.8.0
