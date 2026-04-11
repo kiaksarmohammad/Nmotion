@@ -39,36 +39,44 @@ def _preprocess_frame(bgr: np.ndarray, device: torch.device) -> torch.Tensor:
     return t.unsqueeze(0).to(device)
 
 
-def extract_flow(
-    video_path: Path,
-    device: str = "cuda",
-) -> tuple[np.ndarray, float]:
-    """Extract dense optical flow from a video using RAFT-Large.
-
-    Streams frames pair-by-pair from the video to avoid loading all
-    frames into RAM (a 5-min 1080p video would need ~56 GB otherwise).
-
-    Args:
-        video_path: Path to video file.
-        device: "cuda" or "cpu".
-
-    Returns:
-        flow_fields: float32 array [N-1, H, W, 2] (u, v displacement)
-        fps: video frame rate
-    """
-    dev = torch.device(device if torch.cuda.is_available() else "cpu")
-    logger.info("Loading RAFT-Large on %s", dev)
-
-    # Reduce VRAM fragmentation — the correlation volume at 1080p is 3.9 GiB,
-    # which fails if the allocator has fragmented the remaining free space
-    if dev.type == "cuda":
+def _load_raft(device: torch.device) -> torch.nn.Module:
+    """Load RAFT-Large once; reuse across videos."""
+    if device.type == "cuda":
         import os
         os.environ.setdefault(
             "PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True"
         )
-
     weights = Raft_Large_Weights.C_T_SKHT_V2
-    model = raft_large(weights=weights).to(dev).eval()
+    return raft_large(weights=weights).to(device).eval()
+
+
+def extract_flow(
+    video_path: Path,
+    output_path: Path,
+    device: str = "cuda",
+    model: Optional[torch.nn.Module] = None,
+) -> tuple[Path, float]:
+    """Extract dense optical flow from a video using RAFT-Large.
+
+    Streams frames pair-by-pair and writes each flow field directly to a
+    memory-mapped .npy file on disk.  Peak RAM ≈ 2 × one frame (prev + curr)
+    + one flow field — independent of video length.
+
+    Args:
+        video_path: Path to video file.
+        output_path: Where to save the [N-1, H, W, 2] float32 .npy file.
+        device: "cuda" or "cpu".
+        model: Pre-loaded RAFT model (avoids reloading per video).
+
+    Returns:
+        output_path: Path to the saved .npy file.
+        fps: video frame rate.
+    """
+    dev = torch.device(device if torch.cuda.is_available() else "cpu")
+
+    if model is None:
+        logger.info("Loading RAFT-Large on %s", dev)
+        model = _load_raft(dev)
 
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
@@ -78,15 +86,21 @@ def extract_flow(
     n_total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     logger.info("Video: %s — %d frames, %.1f fps", video_path.name, n_total, fps)
 
-    # Read first frame
     ret, prev_frame = cap.read()
     if not ret:
         cap.release()
         raise ValueError(f"Cannot read first frame: {video_path}")
 
     orig_h, orig_w = prev_frame.shape[:2]
+    n_pairs = max(n_total - 1, 1)
 
-    flows = []
+    # Pre-allocate a memory-mapped file so flow is written directly to disk
+    # instead of accumulating in RAM (1680 frames × 1920×1080×2×4B = 27 GB)
+    memmap = np.lib.format.open_memmap(
+        str(output_path), mode="w+", dtype=np.float32,
+        shape=(n_pairs, orig_h, orig_w, 2),
+    )
+
     frame_idx = 0
     with torch.no_grad(), torch.amp.autocast(device_type=dev.type, dtype=torch.float16):
         while True:
@@ -99,24 +113,44 @@ def extract_flow(
 
             flow_predictions = model(t1, t2)
             flow = flow_predictions[-1]  # [1, 2, H, W]
-            # Crop padding back to original frame size
             flow = flow[0, :, :orig_h, :orig_w]  # [2, H, W]
-            flows.append(flow.cpu().numpy().transpose(1, 2, 0))  # [H, W, 2]
+
+            memmap[frame_idx] = flow.cpu().numpy().transpose(1, 2, 0)
 
             prev_frame = curr_frame
             frame_idx += 1
 
             if frame_idx % 100 == 0:
-                logger.info("  processed %d/%d frame pairs", frame_idx, max(n_total - 1, 1))
+                logger.info("  processed %d/%d frame pairs", frame_idx, n_pairs)
 
     cap.release()
 
-    if not flows:
+    if frame_idx == 0:
+        del memmap
+        output_path.unlink(missing_ok=True)
         raise ValueError(f"Video has <2 readable frames: {video_path}")
 
-    flow_fields = np.stack(flows, axis=0)  # [N-1, H, W, 2]
-    logger.info("Flow extraction complete: %s", flow_fields.shape)
-    return flow_fields, fps
+    # Truncate if video had fewer readable frames than CAP_PROP_FRAME_COUNT
+    if frame_idx < n_pairs:
+        logger.info("  truncating %d → %d pairs (video ended early)", n_pairs, frame_idx)
+        del memmap
+        src = np.lib.format.open_memmap(str(output_path), mode="r")
+        trunc_path = str(output_path) + ".trunc"
+        dst = np.lib.format.open_memmap(
+            trunc_path, mode="w+", dtype=np.float32,
+            shape=(frame_idx, orig_h, orig_w, 2),
+        )
+        # Copy in chunks to stay RAM-friendly
+        chunk = 64
+        for i in range(0, frame_idx, chunk):
+            dst[i : i + chunk] = src[i : i + chunk]
+        del src, dst
+        Path(trunc_path).replace(output_path)
+    else:
+        del memmap
+
+    logger.info("Flow extraction complete: (%d, %d, %d, 2)", frame_idx, orig_h, orig_w)
+    return output_path, fps
 
 
 def extract_all_flows(
@@ -148,6 +182,10 @@ def extract_all_flows(
             d.name for d in video_dir.iterdir()
             if d.is_dir() and not d.name.startswith(".")
         )
+
+    dev = torch.device(device if torch.cuda.is_available() else "cpu")
+    logger.info("Loading RAFT-Large on %s", dev)
+    model = _load_raft(dev)
 
     result: Dict[str, List[Path]] = {}
 
@@ -181,15 +219,19 @@ def extract_all_flows(
                 saved_paths.append(npy_path)
                 continue
 
+            tmp_path = npy_path.with_suffix(".npy.tmp")
             try:
-                flow_fields, fps = extract_flow(video_path, device=device)
-                np.save(npy_path, flow_fields)
+                _, fps = extract_flow(
+                    video_path, tmp_path, device=device, model=model,
+                )
+                tmp_path.rename(npy_path)
                 np.save(fps_path, np.array(fps))
                 saved_paths.append(npy_path)
-                logger.info("  saved: %s (%s)", npy_path.name, flow_fields.shape)
+                logger.info("  saved: %s", npy_path.name)
             except Exception:
                 logger.exception("  FAILED: %s", video_path.name)
             finally:
+                tmp_path.unlink(missing_ok=True)
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
 
