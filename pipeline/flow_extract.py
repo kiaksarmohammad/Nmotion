@@ -23,66 +23,20 @@ logger = logging.getLogger(__name__)
 VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv", ".wmv"}
 
 
-def _load_frames(video_path: Path) -> tuple[np.ndarray, float]:
-    """Load all frames from a video file.
-
-    Returns:
-        frames: uint8 array [N, H, W, 3] (BGR)
-        fps: frames per second
-    """
-    cap = cv2.VideoCapture(str(video_path))
-    if not cap.isOpened():
-        raise IOError(f"Cannot open video: {video_path}")
-
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    frames = []
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-        frames.append(frame)
-    cap.release()
-
-    if len(frames) < 2:
-        raise ValueError(f"Video has {len(frames)} frames, need at least 2: {video_path}")
-
-    return np.stack(frames, axis=0), fps
-
-
-MAX_LONG_EDGE = 540  # Downscale to fit RAFT correlation volume in 16GB VRAM
-
-
-def _preprocess_pair(
-    frame1: np.ndarray, frame2: np.ndarray, device: torch.device
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Convert a BGR frame pair to RAFT input tensors.
+def _preprocess_frame(bgr: np.ndarray, device: torch.device) -> torch.Tensor:
+    """Convert a single BGR frame to a RAFT input tensor.
 
     RAFT expects float32 tensors in [0, 1] range, shape [1, 3, H, W].
-    Downscales if the long edge exceeds MAX_LONG_EDGE to avoid OOM on the
-    correlation volume (memory scales as H²×W²). Pads to dimensions
-    divisible by 8 (RAFT requirement).
+    Pads to dimensions divisible by 8 (RAFT requirement).
     """
-    def _to_tensor(bgr: np.ndarray) -> torch.Tensor:
-        h, w = bgr.shape[:2]
-        # Downscale if needed to prevent CUDA OOM
-        long_edge = max(h, w)
-        if long_edge > MAX_LONG_EDGE:
-            scale = MAX_LONG_EDGE / long_edge
-            new_w = int(w * scale)
-            new_h = int(h * scale)
-            bgr = cv2.resize(bgr, (new_w, new_h), interpolation=cv2.INTER_AREA)
-
-        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-        t = torch.from_numpy(rgb).permute(2, 0, 1).float() / 255.0
-        # Pad to dimensions divisible by 8
-        _, h, w = t.shape
-        pad_h = (8 - h % 8) % 8
-        pad_w = (8 - w % 8) % 8
-        if pad_h > 0 or pad_w > 0:
-            t = torch.nn.functional.pad(t, (0, pad_w, 0, pad_h), mode="constant")
-        return t.unsqueeze(0).to(device)
-
-    return _to_tensor(frame1), _to_tensor(frame2)
+    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+    t = torch.from_numpy(rgb).permute(2, 0, 1).float() / 255.0
+    _, h, w = t.shape
+    pad_h = (8 - h % 8) % 8
+    pad_w = (8 - w % 8) % 8
+    if pad_h > 0 or pad_w > 0:
+        t = torch.nn.functional.pad(t, (0, pad_w, 0, pad_h), mode="constant")
+    return t.unsqueeze(0).to(device)
 
 
 def extract_flow(
@@ -90,6 +44,9 @@ def extract_flow(
     device: str = "cuda",
 ) -> tuple[np.ndarray, float]:
     """Extract dense optical flow from a video using RAFT-Large.
+
+    Streams frames pair-by-pair from the video to avoid loading all
+    frames into RAM (a 5-min 1080p video would need ~56 GB otherwise).
 
     Args:
         video_path: Path to video file.
@@ -105,34 +62,49 @@ def extract_flow(
     weights = Raft_Large_Weights.C_T_SKHT_V2
     model = raft_large(weights=weights).to(dev).eval()
 
-    frames, fps = _load_frames(video_path)
-    n_frames = len(frames)
-    logger.info("Loaded %d frames (%.1f fps) from %s", n_frames, fps, video_path.name)
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise IOError(f"Cannot open video: {video_path}")
 
-    # Compute target dimensions after downscaling (for cropping padding)
-    orig_h, orig_w = frames[0].shape[:2]
-    long_edge = max(orig_h, orig_w)
-    if long_edge > MAX_LONG_EDGE:
-        scale = MAX_LONG_EDGE / long_edge
-        target_h = int(orig_h * scale)
-        target_w = int(orig_w * scale)
-        logger.info("  Downscaling %dx%d → %dx%d for VRAM safety", orig_w, orig_h, target_w, target_h)
-    else:
-        target_h, target_w = orig_h, orig_w
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    n_total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    logger.info("Video: %s — %d frames, %.1f fps", video_path.name, n_total, fps)
+
+    # Read first frame
+    ret, prev_frame = cap.read()
+    if not ret:
+        cap.release()
+        raise ValueError(f"Cannot read first frame: {video_path}")
+
+    orig_h, orig_w = prev_frame.shape[:2]
 
     flows = []
+    frame_idx = 0
     with torch.no_grad():
-        for i in range(n_frames - 1):
-            t1, t2 = _preprocess_pair(frames[i], frames[i + 1], dev)
-            # RAFT returns a list of flow predictions (one per iteration), take the last
+        while True:
+            ret, curr_frame = cap.read()
+            if not ret:
+                break
+
+            t1 = _preprocess_frame(prev_frame, dev)
+            t2 = _preprocess_frame(curr_frame, dev)
+
             flow_predictions = model(t1, t2)
             flow = flow_predictions[-1]  # [1, 2, H, W]
-            # Crop padding back to target frame size
-            flow = flow[0, :, :target_h, :target_w]  # [2, H, W]
+            # Crop padding back to original frame size
+            flow = flow[0, :, :orig_h, :orig_w]  # [2, H, W]
             flows.append(flow.cpu().numpy().transpose(1, 2, 0))  # [H, W, 2]
 
-            if (i + 1) % 100 == 0:
-                logger.info("  processed %d/%d frame pairs", i + 1, n_frames - 1)
+            prev_frame = curr_frame
+            frame_idx += 1
+
+            if frame_idx % 100 == 0:
+                logger.info("  processed %d/%d frame pairs", frame_idx, max(n_total - 1, 1))
+
+    cap.release()
+
+    if not flows:
+        raise ValueError(f"Video has <2 readable frames: {video_path}")
 
     flow_fields = np.stack(flows, axis=0)  # [N-1, H, W, 2]
     logger.info("Flow extraction complete: %s", flow_fields.shape)
