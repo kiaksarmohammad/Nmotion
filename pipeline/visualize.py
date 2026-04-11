@@ -22,10 +22,10 @@ logger = logging.getLogger(__name__)
 # Consistent colors per group
 GROUP_COLORS = {
     "normal": "#2ecc71",
-    "spasms": "#e74c3c",
-    "hypertonia": "#3498db",
+    "seizure": "#e74c3c",
+    "hypotonic": "#3498db",
 }
-GROUP_ORDER = ["normal", "spasms", "hypertonia"]
+GROUP_ORDER = ["normal", "seizure", "hypotonic"]
 
 
 def _get_color(group: str) -> str:

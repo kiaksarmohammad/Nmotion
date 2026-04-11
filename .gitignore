@@ -28,3 +28,7 @@ output/
 # Logs
 logs
 *.log
+
+# Video data (large files, not tracked)
+data/videos/
+mltrainingdata/

@@ -20,7 +20,7 @@ from torchvision.models.optical_flow import raft_large, Raft_Large_Weights
 
 logger = logging.getLogger(__name__)
 
-VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv"}
+VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv", ".wmv"}
 
 
 def _load_frames(video_path: Path) -> tuple[np.ndarray, float]:
