@@ -45,3 +45,27 @@ class TestExtractClips:
         np.testing.assert_array_equal(clips[0][:, 0, 0, 0], np.arange(20))
         # Second clip: frames 20-39
         np.testing.assert_array_equal(clips[1][:, 0, 0, 0], np.arange(20, 40))
+
+
+from pipeline.features import extract_clip_features
+
+
+class TestClipFeatures:
+    def test_returns_dataframe_with_video_id(self):
+        rng = np.random.default_rng(42)
+        clips = [rng.standard_normal((50, 4, 4, 2)).astype(np.float32) for _ in range(3)]
+        labels = ["seizure", "seizure", "normal"]
+        video_ids = ["vid1", "vid1", "vid2"]
+        fps_values = [30.0, 30.0, 30.0]
+
+        df = extract_clip_features(clips, labels, video_ids, fps_values)
+        assert len(df) == 3
+        assert "video_id" in df.columns
+        assert "group" in df.columns
+        assert "sample_entropy" in df.columns
+
+    def test_short_clip_no_crash(self):
+        """Clips shorter than ideal should still produce features (with NaN MSE)."""
+        clip = np.random.randn(20, 4, 4, 2).astype(np.float32)
+        df = extract_clip_features([clip], ["normal"], ["v1"], [30.0])
+        assert len(df) == 1

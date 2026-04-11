@@ -273,3 +273,37 @@ def extract_all_features(
     logger.info("Saved features to %s (%d rows)", combined_path, len(df))
 
     return df
+
+
+def extract_clip_features(
+    clips: List[np.ndarray],
+    labels: List[str],
+    video_ids: List[str],
+    fps_values: List[float],
+) -> pd.DataFrame:
+    """Extract features from pre-extracted clips.
+
+    Wraps extract_features_single for clip-level operation, adding
+    a video_id column for grouped cross-validation.
+
+    Args:
+        clips: List of [N, H, W, 2] flow clips.
+        labels: Group label per clip.
+        video_ids: Source video identifier per clip.
+        fps_values: FPS per clip.
+
+    Returns:
+        DataFrame with one row per clip, including 'video_id' column.
+    """
+    rows: List[Dict] = []
+    for i, (clip, label, vid_id, fps) in enumerate(
+        zip(clips, labels, video_ids, fps_values)
+    ):
+        try:
+            row = extract_features_single(clip, fps, f"{vid_id}_clip{i}", label)
+            row["video_id"] = vid_id
+            rows.append(row)
+        except Exception:
+            logger.exception("Failed on clip %d from %s", i, vid_id)
+
+    return pd.DataFrame(rows) if rows else pd.DataFrame()
