@@ -49,15 +49,29 @@ def _load_frames(video_path: Path) -> tuple[np.ndarray, float]:
     return np.stack(frames, axis=0), fps
 
 
+MAX_LONG_EDGE = 540  # Downscale to fit RAFT correlation volume in 16GB VRAM
+
+
 def _preprocess_pair(
     frame1: np.ndarray, frame2: np.ndarray, device: torch.device
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Convert a BGR frame pair to RAFT input tensors.
 
     RAFT expects float32 tensors in [0, 1] range, shape [1, 3, H, W].
-    Resizes to dimensions divisible by 8 (RAFT requirement).
+    Downscales if the long edge exceeds MAX_LONG_EDGE to avoid OOM on the
+    correlation volume (memory scales as H²×W²). Pads to dimensions
+    divisible by 8 (RAFT requirement).
     """
     def _to_tensor(bgr: np.ndarray) -> torch.Tensor:
+        h, w = bgr.shape[:2]
+        # Downscale if needed to prevent CUDA OOM
+        long_edge = max(h, w)
+        if long_edge > MAX_LONG_EDGE:
+            scale = MAX_LONG_EDGE / long_edge
+            new_w = int(w * scale)
+            new_h = int(h * scale)
+            bgr = cv2.resize(bgr, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
         t = torch.from_numpy(rgb).permute(2, 0, 1).float() / 255.0
         # Pad to dimensions divisible by 8
@@ -95,6 +109,17 @@ def extract_flow(
     n_frames = len(frames)
     logger.info("Loaded %d frames (%.1f fps) from %s", n_frames, fps, video_path.name)
 
+    # Compute target dimensions after downscaling (for cropping padding)
+    orig_h, orig_w = frames[0].shape[:2]
+    long_edge = max(orig_h, orig_w)
+    if long_edge > MAX_LONG_EDGE:
+        scale = MAX_LONG_EDGE / long_edge
+        target_h = int(orig_h * scale)
+        target_w = int(orig_w * scale)
+        logger.info("  Downscaling %dx%d → %dx%d for VRAM safety", orig_w, orig_h, target_w, target_h)
+    else:
+        target_h, target_w = orig_h, orig_w
+
     flows = []
     with torch.no_grad():
         for i in range(n_frames - 1):
@@ -102,9 +127,8 @@ def extract_flow(
             # RAFT returns a list of flow predictions (one per iteration), take the last
             flow_predictions = model(t1, t2)
             flow = flow_predictions[-1]  # [1, 2, H, W]
-            # Crop padding back to original frame size
-            h, w = frames[i].shape[:2]
-            flow = flow[0, :, :h, :w]  # [2, H, W]
+            # Crop padding back to target frame size
+            flow = flow[0, :, :target_h, :target_w]  # [2, H, W]
             flows.append(flow.cpu().numpy().transpose(1, 2, 0))  # [H, W, 2]
 
             if (i + 1) % 100 == 0:
@@ -185,6 +209,9 @@ def extract_all_flows(
                 logger.info("  saved: %s (%s)", npy_path.name, flow_fields.shape)
             except Exception:
                 logger.exception("  FAILED: %s", video_path.name)
+            finally:
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
         result[group] = saved_paths
 
