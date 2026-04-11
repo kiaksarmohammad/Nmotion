@@ -14,3 +14,6 @@ matplotlib>=3.8.0
 
 # Video I/O
 opencv-python-headless>=4.8.0
+
+# Classification
+xgboost>=2.0.0
