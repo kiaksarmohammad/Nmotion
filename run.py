@@ -4,8 +4,9 @@ Nmotion — Neonatal movement analysis pipeline.
 Usage:
     python run.py --video-dir data/videos
     python run.py --video-dir data/videos --skip-flow     # use cached .npy
-    python run.py --video-dir data/videos --groups normal spasms
+    python run.py --video-dir data/videos --groups normal seizure
     python run.py --video-dir data/videos --device cpu
+    python run.py --video-dir data/videos --skip-flow --classify
 """
 
 from __future__ import annotations
@@ -15,6 +16,7 @@ import logging
 import sys
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 from pipeline.flow_extract import extract_all_flows
@@ -50,6 +52,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--device", default=None,
         help="Torch device: 'cuda' or 'cpu' (default: auto-detect)",
+    )
+    p.add_argument(
+        "--classify", action="store_true",
+        help="Run clip extraction, augmentation, and XGBoost classification",
+    )
+    p.add_argument(
+        "--no-augment", action="store_true",
+        help="Skip augmentation during classification (faster, fewer samples)",
     )
     return p.parse_args()
 
@@ -125,6 +135,53 @@ def main() -> None:
     logger.info("STAGE 3: VISUALIZATION")
     logger.info("=" * 50)
     generate_figures(df, flow_dir, output_dir, groups=args.groups)
+
+    # Stage 4: Classification (optional)
+    if args.classify:
+        from pipeline.clip_extract import extract_all_clips
+        from pipeline.augment import apply_augmentations
+        from pipeline.features import extract_clip_features
+        from pipeline.classify import train_evaluate_grouped_cv
+
+        logger.info("=" * 50)
+        logger.info("STAGE 4: CLIP EXTRACTION & CLASSIFICATION")
+        logger.info("=" * 50)
+
+        clips, labels, video_ids, fps_values = extract_all_clips(
+            flow_dir, groups=args.groups
+        )
+
+        if not args.no_augment:
+            logger.info("Augmenting clips...")
+            aug_clips, aug_labels, aug_video_ids, aug_fps = [], [], [], []
+            for clip, label, vid_id, fps in zip(clips, labels, video_ids, fps_values):
+                augmented = apply_augmentations(clip)
+                for aug in augmented:
+                    aug_clips.append(aug)
+                    aug_labels.append(label)
+                    aug_video_ids.append(vid_id)
+                    aug_fps.append(fps)
+            clips, labels, video_ids, fps_values = (
+                aug_clips, aug_labels, aug_video_ids, aug_fps
+            )
+            logger.info("After augmentation: %d clips", len(clips))
+
+        logger.info("Extracting clip features...")
+        clip_df = extract_clip_features(clips, labels, video_ids, fps_values)
+
+        if clip_df.empty:
+            logger.error("No clip features extracted.")
+        else:
+            clip_csv = output_dir / "dataframes" / "clip_features.csv"
+            clip_df.to_csv(clip_csv, index=False)
+            logger.info("Saved clip features to %s (%d rows)", clip_csv, len(clip_df))
+
+            results = train_evaluate_grouped_cv(clip_df)
+            logger.info(
+                "Classification accuracy: %.1f%% (±%.1f%%)",
+                results["accuracy"] * 100,
+                np.std(results["fold_accuracies"]) * 100,
+            )
 
     _print_summary(df)
     logger.info("Done. Figures in %s/figures/, data in %s/dataframes/", output_dir, output_dir)
