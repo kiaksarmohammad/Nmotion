@@ -59,6 +59,14 @@ def extract_flow(
     dev = torch.device(device if torch.cuda.is_available() else "cpu")
     logger.info("Loading RAFT-Large on %s", dev)
 
+    # Reduce VRAM fragmentation — the correlation volume at 1080p is 3.9 GiB,
+    # which fails if the allocator has fragmented the remaining free space
+    if dev.type == "cuda":
+        import os
+        os.environ.setdefault(
+            "PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True"
+        )
+
     weights = Raft_Large_Weights.C_T_SKHT_V2
     model = raft_large(weights=weights).to(dev).eval()
 
@@ -80,7 +88,7 @@ def extract_flow(
 
     flows = []
     frame_idx = 0
-    with torch.no_grad():
+    with torch.no_grad(), torch.amp.autocast(device_type=dev.type, dtype=torch.float16):
         while True:
             ret, curr_frame = cap.read()
             if not ret:
