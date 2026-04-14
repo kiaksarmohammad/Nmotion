@@ -2,6 +2,7 @@
 __pycache__/
 *.pyc
 .env
+.env.*
 .venv/
 venv*/
 trecvit_env/
