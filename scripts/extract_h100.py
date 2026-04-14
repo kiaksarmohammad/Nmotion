@@ -106,54 +106,41 @@ class FrameReader:
 # Batched preprocessing
 # ---------------------------------------------------------------------------
 
+TARGET_H, TARGET_W = 520, 960  # Divisible by 8 — no padding, no recompilation
+
+
 def preprocess_batch(
     frames: List[np.ndarray], device: torch.device,
 ) -> torch.Tensor:
     """Convert a list of BGR frames to a batched RAFT input tensor.
 
-    Returns [B, 3, H_padded, W_padded] float32 on device.
-    All frames must have the same spatial dimensions.
+    Resizes all frames to TARGET_H x TARGET_W so torch.compile only traces once.
+    Returns [B, 3, TARGET_H, TARGET_W] float32 on device.
     """
     tensors = []
     for bgr in frames:
+        bgr = cv2.resize(bgr, (TARGET_W, TARGET_H), interpolation=cv2.INTER_AREA)
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
         t = torch.from_numpy(rgb).permute(2, 0, 1).float() / 255.0
         tensors.append(t)
 
-    batch = torch.stack(tensors)  # [B, 3, H, W]
-    _, _, h, w = batch.shape
-    pad_h = (8 - h % 8) % 8
-    pad_w = (8 - w % 8) % 8
-    if pad_h > 0 or pad_w > 0:
-        batch = torch.nn.functional.pad(batch, (0, pad_w, 0, pad_h))
-    return batch.to(device)
+    return torch.stack(tensors).to(device)  # [B, 3, TARGET_H, TARGET_W]
 
 
 # ---------------------------------------------------------------------------
 # Core extraction — batched + memmap
 # ---------------------------------------------------------------------------
 
-def extract_flow_batched(
+def _run_batched_inference(
     video_path: Path,
-    output_path: Path,
     model: torch.nn.Module,
     device: torch.device,
-    batch_size: int = 16,
-) -> tuple[Path, float]:
-    """Extract optical flow with batched RAFT inference.
+    batch_size: int,
+    on_batch,
+) -> tuple[int, float, float]:
+    """Shared inference loop — calls on_batch(flow_np, frame_idx) per batch.
 
-    Reads frames in a background thread, batches B consecutive pairs,
-    runs RAFT once per batch, writes results to a memory-mapped .npy.
-
-    Args:
-        video_path: Input video.
-        output_path: Where to write the [N-1, H, W, 2] float32 .npy.
-        model: Pre-loaded (and optionally compiled) RAFT model.
-        device: CUDA device.
-        batch_size: Number of frame pairs per forward pass.
-
-    Returns:
-        (output_path, fps)
+    Returns (frame_idx, fps, elapsed).
     """
     reader = FrameReader(video_path, buffer_size=batch_size * 3).start()
     fps = reader.fps
@@ -165,25 +152,15 @@ def extract_flow_batched(
         video_path.name, n_total, fps, batch_size,
     )
 
-    # Read first frame
     prev_frame = reader.next_frame()
     if prev_frame is None:
         raise ValueError(f"Cannot read first frame: {video_path}")
-
-    orig_h, orig_w = prev_frame.shape[:2]
-
-    # Pre-allocate memmap on disk
-    memmap = np.lib.format.open_memmap(
-        str(output_path), mode="w+", dtype=np.float32,
-        shape=(n_pairs, orig_h, orig_w, 2),
-    )
 
     frame_idx = 0
     t_start = time.perf_counter()
 
     with torch.no_grad(), torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
         while True:
-            # Collect a batch of frame pairs
             prev_frames: List[np.ndarray] = []
             curr_frames: List[np.ndarray] = []
 
@@ -199,16 +176,19 @@ def extract_flow_batched(
                 break
 
             B = len(prev_frames)
-            t1 = preprocess_batch(prev_frames, device)  # [B, 3, H, W]
+
+            if B < batch_size:
+                prev_frames.extend([prev_frames[-1]] * (batch_size - B))
+                curr_frames.extend([curr_frames[-1]] * (batch_size - B))
+
+            t1 = preprocess_batch(prev_frames, device)
             t2 = preprocess_batch(curr_frames, device)
 
             flow_preds = model(t1, t2)
-            flow_batch = flow_preds[-1]  # [B, 2, H_pad, W_pad]
-            flow_batch = flow_batch[:, :, :orig_h, :orig_w]  # [B, 2, H, W]
+            flow_batch = flow_preds[-1]  # [batch_size, 2, TARGET_H, TARGET_W]
 
-            # Write directly to memmap — no RAM accumulation
-            flow_np = flow_batch.cpu().numpy().transpose(0, 2, 3, 1)  # [B, H, W, 2]
-            memmap[frame_idx : frame_idx + B] = flow_np
+            flow_np = flow_batch[:B].cpu().numpy().transpose(0, 2, 3, 1)
+            on_batch(flow_np, frame_idx)
 
             frame_idx += B
 
@@ -221,11 +201,45 @@ def extract_flow_batched(
                     frame_idx, n_pairs, rate, eta,
                 )
 
-    # Handle truncation if fewer frames than metadata claimed
+    elapsed = time.perf_counter() - t_start
     if frame_idx == 0:
-        del memmap
-        output_path.unlink(missing_ok=True)
         raise ValueError(f"Video has <2 readable frames: {video_path}")
+
+    logger.info(
+        "  done: %d pairs in %.1fs (%.1f pairs/sec)",
+        frame_idx, elapsed, frame_idx / elapsed,
+    )
+    return frame_idx, fps, elapsed
+
+
+def extract_flow_batched(
+    video_path: Path,
+    output_path: Path,
+    model: torch.nn.Module,
+    device: torch.device,
+    batch_size: int = 16,
+) -> tuple[Path, float]:
+    """Extract optical flow to disk via memory-mapped .npy.
+
+    Returns (output_path, fps).
+    """
+    reader_peek = FrameReader(video_path, buffer_size=2).start()
+    n_pairs = max(reader_peek.n_frames - 1, 1)
+    # Release — the real reader is created inside _run_batched_inference
+    reader_peek.cap.release()
+
+    proc_h, proc_w = TARGET_H, TARGET_W
+    memmap = np.lib.format.open_memmap(
+        str(output_path), mode="w+", dtype=np.float32,
+        shape=(n_pairs, proc_h, proc_w, 2),
+    )
+
+    def on_batch(flow_np: np.ndarray, idx: int) -> None:
+        memmap[idx : idx + flow_np.shape[0]] = flow_np
+
+    frame_idx, fps, _ = _run_batched_inference(
+        video_path, model, device, batch_size, on_batch,
+    )
 
     if frame_idx < n_pairs:
         logger.info("  truncating %d → %d pairs", n_pairs, frame_idx)
@@ -234,7 +248,7 @@ def extract_flow_batched(
         trunc_path = str(output_path) + ".trunc"
         dst = np.lib.format.open_memmap(
             trunc_path, mode="w+", dtype=np.float32,
-            shape=(frame_idx, orig_h, orig_w, 2),
+            shape=(frame_idx, proc_h, proc_w, 2),
         )
         chunk = 64
         for i in range(0, frame_idx, chunk):
@@ -244,12 +258,121 @@ def extract_flow_batched(
     else:
         del memmap
 
-    elapsed = time.perf_counter() - t_start
-    logger.info(
-        "  done: %d pairs in %.1fs (%.1f pairs/sec)",
-        frame_idx, elapsed, frame_idx / elapsed,
-    )
     return output_path, fps
+
+
+def extract_flow_compact_streaming(
+    video_path: Path,
+    compact_dir: Path,
+    stem: str,
+    model: torch.nn.Module,
+    device: torch.device,
+    batch_size: int = 16,
+    target_size: int = 128,
+) -> float:
+    """Extract optical flow and compute compact representations in one pass.
+
+    Never writes the full-resolution flow to disk — computes mag_ts, spatial
+    summary, and downscaled flow batch-by-batch during inference. Peak disk
+    usage is ~50 MB per video instead of potentially 30+ GB.
+
+    Returns fps.
+    """
+    compact_dir.mkdir(parents=True, exist_ok=True)
+
+    proc_h, proc_w = TARGET_H, TARGET_W
+    scale_x = target_size / proc_w
+    scale_y = target_size / proc_h
+
+    # Accumulators for compact representations
+    mag_ts_chunks: List[np.ndarray] = []
+    spatial_chunks: List[np.ndarray] = []
+    flow128_chunks: List[np.ndarray] = []
+
+    def on_batch(flow_np: np.ndarray, idx: int) -> None:
+        """Compute compact summaries from this batch's flow output."""
+        B = flow_np.shape[0]  # [B, TARGET_H, TARGET_W, 2]
+
+        # --- Magnitude time series [B, 6] ---
+        stats = np.empty((B, 6), dtype=np.float32)
+        for i in range(B):
+            mag = np.sqrt(flow_np[i, :, :, 0] ** 2 + flow_np[i, :, :, 1] ** 2)
+            flat = mag.ravel()
+            stats[i, 0] = flat.mean()
+            stats[i, 1] = flat.max()
+            stats[i, 2] = flat.std()
+            stats[i, 3] = np.median(flat)
+            stats[i, 4] = np.percentile(flat, 5)
+            stats[i, 5] = np.percentile(flat, 95)
+        mag_ts_chunks.append(stats)
+
+        # --- Spatial summary [B, 12] ---
+        mid_h, mid_w = proc_h // 2, proc_w // 2
+        summary = np.empty((B, 12), dtype=np.float32)
+        for i in range(B):
+            u, v = flow_np[i, :, :, 0], flow_np[i, :, :, 1]
+            mag = np.sqrt(u ** 2 + v ** 2)
+
+            summary[i, 0] = mag[:mid_h, :mid_w].mean()
+            summary[i, 1] = mag[:mid_h, mid_w:].mean()
+            summary[i, 2] = mag[mid_h:, :mid_w].mean()
+            summary[i, 3] = mag[mid_h:, mid_w:].mean()
+
+            left_energy = (mag[:, :mid_w] ** 2).sum()
+            right_energy = (mag[:, mid_w:] ** 2).sum()
+            total = left_energy + right_energy
+            summary[i, 4] = left_energy / total if total > 0 else 0.5
+
+            dvdx = np.gradient(v, axis=1)
+            dudy = np.gradient(u, axis=0)
+            summary[i, 5] = (dvdx - dudy).mean()
+
+            dudx = np.gradient(u, axis=1)
+            dvdy = np.gradient(v, axis=0)
+            summary[i, 6] = (dudx + dvdy).mean()
+
+            mean_u, mean_v = u.mean(), v.mean()
+            mean_mag = np.sqrt(mean_u ** 2 + mean_v ** 2)
+            if mean_mag > 1e-6:
+                dot = (u * mean_u + v * mean_v) / (mag * mean_mag + 1e-8)
+                summary[i, 7] = dot.mean()
+            else:
+                summary[i, 7] = 0.0
+
+            summary[i, 8] = u[:mid_h, :].mean() - u[mid_h:, :].mean()
+            summary[i, 9] = v[:mid_h, :].mean() - v[mid_h:, :].mean()
+            summary[i, 10] = u[:, :mid_w].mean() - u[:, mid_w:].mean()
+            summary[i, 11] = v[:, :mid_w].mean() - v[:, mid_w:].mean()
+        spatial_chunks.append(summary)
+
+        # --- Downscaled flow [B, 128, 128, 2] float16 ---
+        small = np.empty((B, target_size, target_size, 2), dtype=np.float16)
+        for i in range(B):
+            resized = cv2.resize(flow_np[i], (target_size, target_size),
+                                 interpolation=cv2.INTER_AREA)
+            resized[:, :, 0] *= scale_x
+            resized[:, :, 1] *= scale_y
+            small[i] = resized.astype(np.float16)
+        flow128_chunks.append(small)
+
+    frame_idx, fps, _ = _run_batched_inference(
+        video_path, model, device, batch_size, on_batch,
+    )
+
+    # Concatenate and save
+    mag_ts = np.concatenate(mag_ts_chunks)
+    spatial = np.concatenate(spatial_chunks)
+    flow128 = np.concatenate(flow128_chunks)
+
+    np.save(compact_dir / f"{stem}_mag_ts.npy", mag_ts)
+    np.save(compact_dir / f"{stem}_spatial.npy", spatial)
+    np.save(compact_dir / f"{stem}_flow128.npy", flow128)
+    np.save(compact_dir / f"{stem}_fps.npy", np.array(fps))
+
+    size_mb = (mag_ts.nbytes + spatial.nbytes + flow128.nbytes) / 1e6
+    logger.info("  compact saved: %.1f MB (%d frames)", size_mb, frame_idx)
+
+    return fps
 
 
 # ---------------------------------------------------------------------------
@@ -269,8 +392,8 @@ def main() -> None:
         help="Output directory (default: output/)",
     )
     parser.add_argument(
-        "--batch-size", type=int, default=16,
-        help="Frame pairs per RAFT forward pass (default: 16, max ~24 for 80GB)",
+        "--batch-size", type=int, default=24,
+        help="Frame pairs per RAFT forward pass (default: 24, max due to cuDNN grid_sample limit)",
     )
     parser.add_argument(
         "--groups", nargs="+", default=None,
@@ -279,6 +402,14 @@ def main() -> None:
     parser.add_argument(
         "--no-compile", action="store_true",
         help="Skip torch.compile (useful for debugging)",
+    )
+    parser.add_argument(
+        "--num-workers", type=int, default=1,
+        help="Number of parallel processes sharing the GPU (each loads its own model)",
+    )
+    parser.add_argument(
+        "--worker-id", type=int, default=0,
+        help="This worker's index (0..num-workers-1); each processes every N-th video",
     )
     parser.add_argument(
         "--compact", action="store_true",
@@ -292,7 +423,7 @@ def main() -> None:
     logger.info("Device: %s", torch.cuda.get_device_name(device))
     logger.info(
         "VRAM: %.1f GB total",
-        torch.cuda.get_device_properties(device).total_mem / 1e9,
+        torch.cuda.get_device_properties(device).total_memory / 1e9,
     )
 
     # Load model
@@ -303,10 +434,13 @@ def main() -> None:
     if not args.no_compile:
         logger.info("Compiling model with torch.compile (max-autotune)...")
         model = torch.compile(model, mode="max-autotune")
-        # Warmup — first call triggers compilation
-        dummy = torch.randn(1, 3, 520, 960, device=device)
+        # Warmup at exact batch_size + target resolution — compile once, run forever
+        logger.info("Warmup: batch=%d, resolution=%dx%d", args.batch_size, TARGET_H, TARGET_W)
+        dummy = torch.randn(args.batch_size, 3, TARGET_H, TARGET_W, device=device)
         with torch.no_grad(), torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
             _ = model(dummy, dummy)
+        del dummy
+        torch.cuda.empty_cache()
         logger.info("Compilation done.")
 
     # Discover videos
@@ -318,8 +452,6 @@ def main() -> None:
     if args.compact:
         compact_dir = args.output_dir / "compact"
         compact_dir.mkdir(parents=True, exist_ok=True)
-        sys.path.insert(0, str(Path(__file__).parent))
-        from compute_summaries import save_compact_representation
 
     if args.groups is None:
         groups = sorted(
@@ -343,17 +475,23 @@ def main() -> None:
         group_flow_dir = flow_dir / group
         group_flow_dir.mkdir(parents=True, exist_ok=True)
 
-        videos = sorted(
+        all_videos = sorted(
             p for p in group_video_dir.iterdir()
             if p.suffix.lower() in VIDEO_EXTENSIONS
         )
 
+        # Each worker takes every N-th video
+        videos = [v for i, v in enumerate(all_videos)
+                  if i % args.num_workers == args.worker_id]
+
         if not videos:
-            logger.warning("No videos in %s", group_video_dir)
+            logger.warning("No videos for worker %d in %s", args.worker_id, group_video_dir)
             continue
 
         logger.info("=" * 60)
-        logger.info("Group '%s': %d videos", group, len(videos))
+        logger.info("Group '%s': %d/%d videos (worker %d/%d)",
+                    group, len(videos), len(all_videos),
+                    args.worker_id, args.num_workers)
         logger.info("=" * 60)
 
         for video_path in videos:
@@ -371,30 +509,31 @@ def main() -> None:
                 total_skipped += 1
                 continue
 
-            tmp_path = npy_path.with_suffix(".npy.tmp")
             try:
-                _, fps = extract_flow_batched(
-                    video_path, tmp_path, model, device,
-                    batch_size=args.batch_size,
-                )
-                tmp_path.rename(npy_path)
-                np.save(fps_path, np.array(fps))
-                total_done += 1
-
                 if compact_dir is not None:
+                    # Streaming: compute compact representations during
+                    # inference — never writes full flow to disk
                     group_compact = compact_dir / group
-                    save_compact_representation(
-                        npy_path, group_compact, video_path.stem,
+                    extract_flow_compact_streaming(
+                        video_path, group_compact, video_path.stem,
+                        model, device, batch_size=args.batch_size,
                     )
-                    np.save(group_compact / f"{video_path.stem}_fps.npy",
-                            np.array(fps))
-                    npy_path.unlink()
-                    fps_path.unlink(missing_ok=True)
-                    logger.info("  deleted full flow: %s", npy_path.name)
+                else:
+                    # Legacy: write full flow to memmap
+                    tmp_path = npy_path.with_suffix(".npy.tmp")
+                    _, fps = extract_flow_batched(
+                        video_path, tmp_path, model, device,
+                        batch_size=args.batch_size,
+                    )
+                    tmp_path.rename(npy_path)
+                    np.save(fps_path, np.array(fps))
+                total_done += 1
             except Exception:
                 logger.exception("  FAILED: %s", video_path.name)
             finally:
-                tmp_path.unlink(missing_ok=True)
+                # Clean up any leftover tmp from non-compact mode
+                tmp_path_cleanup = npy_path.with_suffix(".npy.tmp")
+                tmp_path_cleanup.unlink(missing_ok=True)
                 torch.cuda.empty_cache()
 
     elapsed = time.perf_counter() - grand_start
