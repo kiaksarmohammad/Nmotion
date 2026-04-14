@@ -1,5 +1,12 @@
-"""Generate publication-quality results from feature discovery output."""
+"""Generate publication-quality results from feature discovery output.
 
+Usage:
+    python scripts/generate_results.py
+    python scripts/generate_results.py --discovery-dir output/feature_discovery \
+                                       --results-dir output/results
+"""
+
+import argparse
 import sys
 from pathlib import Path
 
@@ -11,9 +18,23 @@ import numpy as np
 import pandas as pd
 from matplotlib.colors import LinearSegmentedColormap
 
-# ── paths ──────────────────────────────────────────────────────────────
-DISCOVERY_DIR = Path("output/feature_discovery_full")
-RESULTS_DIR = Path("output/results")
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument(
+        "--discovery-dir", type=Path, default=Path("output/feature_discovery_full"),
+        help="Directory containing ranking.csv and all_features.csv",
+    )
+    p.add_argument(
+        "--results-dir", type=Path, default=Path("output/results"),
+        help="Where to write figures and summary CSV",
+    )
+    return p.parse_args()
+
+
+args = parse_args()
+DISCOVERY_DIR: Path = args.discovery_dir
+RESULTS_DIR: Path = args.results_dir
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
 ranking = pd.read_csv(DISCOVERY_DIR / "ranking.csv")

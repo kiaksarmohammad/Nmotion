@@ -33,7 +33,7 @@ def synthetic_features():
         "dfa_alpha": rng.standard_normal(n),
         "flow_mean": rng.standard_normal(n),
         "flow_std": rng.standard_normal(n),
-        "kinetic_energy_mean": rng.standard_normal(n),
+        "ke_mean": rng.standard_normal(n),
     })
     return df
 

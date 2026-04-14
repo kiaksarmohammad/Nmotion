@@ -1,8 +1,21 @@
-"""
-Nonlinear dynamics feature extraction from dense optical flow fields.
+"""Feature extraction from dense optical flow fields.
 
-Converts flow fields [N-1, H, W, 2] into 1D time series, then computes
-features that discriminate normal vs. spasms vs. hypertonia movement.
+Thin wrapper over `pipeline.compact` and `pipeline.feature_battery`:
+the compact module turns a full-res flow field into its mag_ts + spatial
+summaries in-memory, then the feature battery computes all ~100+ scalar
+features from those summaries.
+
+The canonical entry point for downstream clients is:
+  * `extract_features_single(flow, fps, video_name, group)` — one video/clip
+  * `extract_all_features(flow_dir, output_dir, groups=...)` — batch over a
+    `flow_dir/{group}/*.npy` tree, writes per-group + combined CSVs
+  * `extract_clip_features(clips, labels, video_ids, fps_values)` — clip-level
+    batch with a `video_id` column for grouped CV
+
+For videos processed with the streaming H100 path, compact arrays already
+live on disk under `output/compact/{group}/{stem}_{mag_ts,spatial}.npy`;
+call `compute_all_features` from `pipeline.feature_battery` directly rather
+than re-deriving from a full-res flow.
 """
 
 from __future__ import annotations
@@ -11,194 +24,41 @@ import logging
 from pathlib import Path
 from typing import Dict, List, Optional
 
-import antropy
 import numpy as np
 import pandas as pd
-from scipy import stats as sp_stats
-from scipy.signal import welch
+
+from pipeline.compact import (
+    compute_magnitude_timeseries,
+    compute_spatial_summary,
+)
+from pipeline.feature_battery import compute_all_features
 
 logger = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# Flow → time series
-# ---------------------------------------------------------------------------
-
-def flow_to_timeseries(flow: np.ndarray) -> Dict[str, np.ndarray]:
-    """Convert per-frame flow fields to 1D time series.
-
-    Args:
-        flow: [N, H, W, 2] dense optical flow.
-
-    Returns:
-        Dict of 1D arrays (length N), keyed by series name.
-    """
-    # Per-pixel magnitude: sqrt(u^2 + v^2)
-    magnitude = np.sqrt(flow[..., 0] ** 2 + flow[..., 1] ** 2)  # [N, H, W]
-
-    return {
-        "magnitude_mean": magnitude.mean(axis=(1, 2)),
-        "magnitude_max": magnitude.max(axis=(1, 2)),
-        "magnitude_std": magnitude.std(axis=(1, 2)),
-    }
-
-
-# ---------------------------------------------------------------------------
-# Individual feature extractors
-# ---------------------------------------------------------------------------
-
-def compute_sample_entropy(ts: np.ndarray, order: int = 2) -> float:
-    """Sample entropy — regularity/predictability of motion.
-
-    Low = quasi-periodic (seizures). High = complex/irregular (normal).
-    """
-    return float(antropy.sample_entropy(ts, order=order))
-
-
-def compute_multiscale_entropy(
-    ts: np.ndarray, scales: range = range(1, 21), order: int = 2
-) -> np.ndarray:
-    """Multiscale entropy — sample entropy at multiple coarse-graining scales.
-
-    Seizures: low at seizure frequency scale, high elsewhere.
-    Hypotonic: uniformly low across all scales.
-
-    Returns:
-        Array of entropy values, one per scale.
-    """
-    mse = []
-    for scale in scales:
-        if scale == 1:
-            coarsened = ts
-        else:
-            # Non-overlapping mean of consecutive blocks
-            n = len(ts) - (len(ts) % scale)
-            coarsened = ts[:n].reshape(-1, scale).mean(axis=1)
-
-        if len(coarsened) < 20:
-            mse.append(np.nan)
-            continue
-
-        try:
-            mse.append(float(antropy.sample_entropy(coarsened, order=order)))
-        except Exception:
-            mse.append(np.nan)
-
-    return np.array(mse, dtype=np.float64)
-
-
-def compute_spectral_entropy(ts: np.ndarray, fps: float) -> float:
-    """Spectral entropy — entropy of normalized power spectral density.
-
-    Low = power concentrated in narrow bands (seizures, 1-3 Hz clonic).
-    High = diffuse power distribution (normal).
-    """
-    return float(antropy.spectral_entropy(ts, sf=fps, method="welch", normalize=True))
-
-
-def compute_dfa(ts: np.ndarray) -> float:
-    """Detrended fluctuation analysis — long-range temporal correlations.
-
-    alpha < 0.5: anti-persistent (normal movement).
-    alpha > 0.5: persistent (seizures).
-    alpha ~ 0.5: white noise (hypotonic).
-    """
-    return float(antropy.detrended_fluctuation(ts))
-
-
-def compute_symmetry_index(flow: np.ndarray) -> float:
-    """Approximate symmetry index from flow field.
-
-    Splits at vertical midline, compares L2 norms of left vs right.
-    Returns value in [0, 1] where 1 = perfectly symmetric.
-
-    Focal seizures break symmetry. Generalized seizures ≈ symmetric.
-    """
-    _, _, w, _ = flow.shape
-    mid = w // 2
-
-    magnitude = np.sqrt(flow[..., 0] ** 2 + flow[..., 1] ** 2)
-    left_energy = np.linalg.norm(magnitude[:, :, :mid].ravel())
-    right_energy = np.linalg.norm(magnitude[:, :, mid:].ravel())
-
-    total = left_energy + right_energy + 1e-8
-    return float(1.0 - abs(left_energy - right_energy) / total)
-
-
-def compute_peak_frequency(ts: np.ndarray, fps: float) -> float:
-    """Dominant frequency in motion power spectrum.
-
-    Clonic seizures: 1-3 Hz. Tonic-clonic: 0.5-1 Hz. Normal: no dominant peak.
-    """
-    freqs, psd = welch(ts, fs=fps, nperseg=min(256, len(ts)))
-    return float(freqs[np.argmax(psd)])
-
-
-def compute_kinetic_energy(flow: np.ndarray) -> np.ndarray:
-    """Mean squared flow magnitude per frame — proxy for kinetic energy.
-
-    Returns 1D array (length N) for use as time series.
-    """
-    return (flow[..., 0] ** 2 + flow[..., 1] ** 2).mean(axis=(1, 2))
-
-
-def compute_flow_magnitude_stats(flow: np.ndarray) -> Dict[str, float]:
-    """Distribution statistics of per-pixel flow magnitude across all frames."""
-    magnitude = np.sqrt(flow[..., 0] ** 2 + flow[..., 1] ** 2).ravel()
-    return {
-        "flow_mean": float(magnitude.mean()),
-        "flow_std": float(magnitude.std()),
-        "flow_skew": float(sp_stats.skew(magnitude)),
-        "flow_kurtosis": float(sp_stats.kurtosis(magnitude)),
-    }
-
-
-# ---------------------------------------------------------------------------
-# Aggregation
-# ---------------------------------------------------------------------------
-
 def extract_features_single(
     flow: np.ndarray, fps: float, video_name: str, group: str
 ) -> Dict[str, float | str]:
-    """Extract all features from a single video's flow fields.
+    """Extract all features from a single flow array.
 
     Args:
-        flow: [N, H, W, 2] flow fields.
-        fps: Video frame rate.
-        video_name: Identifier for this video.
-        group: Movement group label.
+        flow: [N, H, W, 2] dense optical flow.
+        fps: Frame rate.
+        video_name: Identifier for this video/clip.
+        group: Class label.
 
     Returns:
-        Dict of feature values (one row of the final DataFrame).
+        Row dict with metadata + ~100 scalar features.
     """
-    ts = flow_to_timeseries(flow)
-    ts_mean = ts["magnitude_mean"]
-    ke = compute_kinetic_energy(flow)
-
-    # Scalar features
-    features: Dict[str, float | str] = {
-        "video": video_name,
-        "group": group,
-        "n_frames": float(len(flow)),
-        "fps": fps,
-        "sample_entropy": compute_sample_entropy(ts_mean),
-        "spectral_entropy": compute_spectral_entropy(ts_mean, fps),
-        "dfa_alpha": compute_dfa(ts_mean),
-        "symmetry_index": compute_symmetry_index(flow),
-        "peak_frequency": compute_peak_frequency(ts_mean, fps),
-        "kinetic_energy_mean": float(ke.mean()),
-        "kinetic_energy_std": float(ke.std()),
-    }
-
-    # Flow magnitude distribution stats
-    features.update(compute_flow_magnitude_stats(flow))
-
-    # Multiscale entropy (stored as separate columns)
-    mse = compute_multiscale_entropy(ts_mean)
-    for i, val in enumerate(mse, start=1):
-        features[f"mse_scale_{i}"] = float(val)
-
-    return features
+    mag_ts = compute_magnitude_timeseries(flow)
+    spatial = compute_spatial_summary(flow)
+    return compute_all_features(
+        mag_ts=mag_ts,
+        spatial=spatial,
+        fps=fps,
+        video_name=video_name,
+        group=group,
+    )
 
 
 def extract_all_features(
@@ -235,20 +95,22 @@ def extract_all_features(
             continue
 
         npy_files = sorted(group_dir.glob("*.npy"))
-        # Filter out fps files
         npy_files = [f for f in npy_files if not f.stem.endswith("_fps")]
 
         if not npy_files:
             logger.warning("No flow files in %s", group_dir)
             continue
 
-        logger.info("Extracting features for group '%s': %d videos", group, len(npy_files))
+        logger.info(
+            "Extracting features for group '%s': %d videos",
+            group, len(npy_files),
+        )
 
         for npy_path in npy_files:
             fps_path = npy_path.parent / f"{npy_path.stem}_fps.npy"
             fps = float(np.load(fps_path)) if fps_path.exists() else 30.0
 
-            flow = np.load(npy_path)
+            flow = np.load(npy_path, mmap_mode="r")
             logger.info("  %s: %s", npy_path.stem, flow.shape)
 
             try:
@@ -263,7 +125,6 @@ def extract_all_features(
 
     df = pd.DataFrame(all_rows)
 
-    # Save per-group and combined
     for group in df["group"].unique():
         group_df = df[df["group"] == group]
         group_df.to_csv(df_dir / f"{group}_features.csv", index=False)
@@ -283,8 +144,7 @@ def extract_clip_features(
 ) -> pd.DataFrame:
     """Extract features from pre-extracted clips.
 
-    Wraps extract_features_single for clip-level operation, adding
-    a video_id column for grouped cross-validation.
+    Adds a ``video_id`` column for grouped cross-validation.
 
     Args:
         clips: List of [N, H, W, 2] flow clips.
@@ -293,7 +153,7 @@ def extract_clip_features(
         fps_values: FPS per clip.
 
     Returns:
-        DataFrame with one row per clip, including 'video_id' column.
+        DataFrame with one row per clip, including 'video_id'.
     """
     rows: List[Dict] = []
     for i, (clip, label, vid_id, fps) in enumerate(

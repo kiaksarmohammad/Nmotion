@@ -72,7 +72,7 @@ def _print_summary(df: pd.DataFrame) -> None:
 
     key_cols = [
         "sample_entropy", "spectral_entropy", "dfa_alpha",
-        "symmetry_index", "peak_frequency", "kinetic_energy_mean",
+        "symmetry_mean", "peak_frequency", "ke_mean",
         "flow_mean", "flow_std",
     ]
     present = [c for c in key_cols if c in df.columns]

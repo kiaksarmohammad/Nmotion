@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import sys
 from pathlib import Path
 
 import matplotlib
@@ -27,15 +28,10 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import xgboost as xgb
-from sklearn.metrics import (
-    accuracy_score,
-    classification_report,
-    confusion_matrix,
-    f1_score,
-)
-from sklearn.model_selection import StratifiedGroupKFold
-from sklearn.preprocessing import LabelEncoder
+
+# Allow running from repo root: `python scripts/classify_discovered.py ...`
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from pipeline.classify import FEATURE_COLS as BASELINE_FEATURES, train_evaluate_grouped_cv
 
 logging.basicConfig(
     level=logging.INFO,
@@ -44,21 +40,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger("classify")
 
-# Original 11 features from pipeline/classify.py
-BASELINE_FEATURES = [
-    "sample_entropy",
-    "spectral_entropy",
-    "dfa_alpha",
-    "symmetry_mean",  # was symmetry_index in old pipeline
-    "peak_frequency",
-    "ke_mean",  # was kinetic_energy_mean
-    "ke_std",  # was kinetic_energy_std
-    "flow_mean",
-    "flow_std",
-    "flow_skew",
-    "flow_kurtosis",
-]
-
 
 def run_cv_experiment(
     df: pd.DataFrame,
@@ -66,127 +47,15 @@ def run_cv_experiment(
     experiment_name: str,
     n_folds: int = 5,
 ) -> dict:
-    """Run stratified grouped CV with XGBoost."""
-    # Filter to features that actually exist and have data
-    valid_cols = [c for c in feature_cols if c in df.columns]
-    if not valid_cols:
-        logger.warning("No valid features for experiment '%s'", experiment_name)
-        return {}
-
-    # Drop rows with all-NaN features
-    X_df = df[valid_cols].copy()
-    valid_mask = X_df.notna().any(axis=1)
-    df_clean = df[valid_mask].copy()
-    X = df_clean[valid_cols].fillna(0).values
-
-    le = LabelEncoder()
-    y = le.fit_transform(df_clean["group"])
-    # Use video name as group — each video is its own group
-    groups = df_clean["video"].values
-
-    # Class weights: inverse frequency
-    counts = df_clean["group"].value_counts()
-    n_total = len(df_clean)
-    n_classes = len(counts)
-    class_weight_map = {
-        cls: n_total / (n_classes * count)
-        for cls, count in counts.items()
-    }
-    sample_weights = np.array([class_weight_map[g] for g in df_clean["group"]])
-
-    # Adjust n_folds if too few samples in any class
-    min_class_count = counts.min()
-    actual_folds = min(n_folds, min_class_count)
-    if actual_folds < 2:
-        logger.warning(
-            "Too few samples in smallest class (%d) for CV in '%s'",
-            min_class_count, experiment_name,
-        )
-        actual_folds = 2
-
-    sgkf = StratifiedGroupKFold(
-        n_splits=actual_folds, shuffle=True, random_state=42,
+    """Run stratified grouped CV with XGBoost; each video is its own CV group."""
+    return train_evaluate_grouped_cv(
+        df,
+        n_folds=n_folds,
+        feature_cols=feature_cols,
+        group_col="video",
+        experiment_name=experiment_name,
+        return_importances=True,
     )
-
-    all_preds = np.full(len(df_clean), -1, dtype=int)
-    all_proba = np.zeros((len(df_clean), n_classes))
-    fold_accs = []
-    fold_f1s = []
-    importances_sum = np.zeros(len(valid_cols))
-
-    for fold_idx, (train_idx, test_idx) in enumerate(
-        sgkf.split(X, y, groups)
-    ):
-        model = xgb.XGBClassifier(
-            n_estimators=200,
-            max_depth=6,
-            learning_rate=0.1,
-            eval_metric="mlogloss",
-            random_state=42,
-            verbosity=0,
-        )
-        model.fit(X[train_idx], y[train_idx], sample_weight=sample_weights[train_idx])
-
-        preds = model.predict(X[test_idx])
-        proba = model.predict_proba(X[test_idx])
-        all_preds[test_idx] = preds
-        all_proba[test_idx] = proba
-
-        fold_acc = accuracy_score(y[test_idx], preds)
-        fold_f1 = f1_score(y[test_idx], preds, average="weighted")
-        fold_accs.append(fold_acc)
-        fold_f1s.append(fold_f1)
-        importances_sum += model.feature_importances_
-
-        logger.info(
-            "  [%s] Fold %d: acc=%.3f  f1=%.3f",
-            experiment_name, fold_idx + 1, fold_acc, fold_f1,
-        )
-
-    # Overall metrics
-    valid = all_preds >= 0
-    y_true = y[valid]
-    y_pred = all_preds[valid]
-    class_names = list(le.classes_)
-
-    overall_acc = accuracy_score(y_true, y_pred)
-    overall_f1 = f1_score(y_true, y_pred, average="weighted")
-    cm = confusion_matrix(y_true, y_pred)
-    report = classification_report(
-        y_true, y_pred, target_names=class_names, output_dict=True,
-    )
-
-    logger.info("=" * 60)
-    logger.info("[%s] RESULTS (%d features, %d folds)", experiment_name, len(valid_cols), actual_folds)
-    logger.info("  Accuracy: %.3f (±%.3f)", overall_acc, np.std(fold_accs))
-    logger.info("  Weighted F1: %.3f (±%.3f)", overall_f1, np.std(fold_f1s))
-    logger.info("\n%s", classification_report(y_true, y_pred, target_names=class_names))
-    logger.info("Confusion matrix:\n%s", cm)
-    logger.info("=" * 60)
-
-    # Normalized feature importances
-    avg_importance = importances_sum / actual_folds
-    importance_df = pd.DataFrame({
-        "feature": valid_cols,
-        "importance": avg_importance,
-    }).sort_values("importance", ascending=False)
-
-    return {
-        "name": experiment_name,
-        "n_features": len(valid_cols),
-        "n_folds": actual_folds,
-        "accuracy": overall_acc,
-        "accuracy_std": float(np.std(fold_accs)),
-        "weighted_f1": overall_f1,
-        "f1_std": float(np.std(fold_f1s)),
-        "fold_accuracies": fold_accs,
-        "fold_f1s": fold_f1s,
-        "per_class": report,
-        "confusion_matrix": cm.tolist(),
-        "class_names": class_names,
-        "feature_importances": importance_df,
-        "class_weights": class_weight_map,
-    }
 
 
 def plot_comparison(results: list[dict], output_dir: Path) -> None:

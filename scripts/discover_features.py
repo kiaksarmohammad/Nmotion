@@ -27,15 +27,9 @@ from scipy import stats as sp_stats
 from sklearn.metrics import roc_auc_score
 from sklearn.preprocessing import label_binarize
 
-# Direct import to avoid pipeline/__init__.py pulling in torch/cv2
-import importlib.util as _ilu
-_spec = _ilu.spec_from_file_location(
-    "feature_battery",
-    str(Path(__file__).resolve().parent.parent / "pipeline" / "feature_battery.py"),
-)
-_fb = _ilu.module_from_spec(_spec)
-_spec.loader.exec_module(_fb)
-compute_all_features = _fb.compute_all_features
+# Ensure repo root is on sys.path when invoked as `python scripts/...`
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from pipeline.feature_battery import compute_all_features
 
 logging.basicConfig(
     level=logging.INFO,

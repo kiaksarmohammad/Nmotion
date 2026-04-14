@@ -1,32 +1,35 @@
-"""Compute compact representations from full-resolution RAFT flow fields.
+"""Compact representations of dense optical flow.
 
-Extracts transferable summaries (~75 MB per video vs ~10 GB full-res)
-that preserve enough information for downstream feature discovery:
+Converts [N, H, W, 2] flow fields into transferable summaries (~75 MB/video
+vs ~10 GB full-res) that preserve enough information for downstream feature
+discovery:
 
-  1. Downscaled flow (128x128) — spatial patterns at body scale
-  2. Magnitude time series (6 stats/frame) — temporal dynamics
-  3. Spatial summary (12 features/frame) — symmetry, curl, divergence
+  1. Magnitude time series (6 stats/frame): mean, max, std, median, p5, p95
+  2. Spatial summary (12 features/frame):   quadrants, symmetry, curl,
+                                            divergence, coherence, and
+                                            directional flow differences
+  3. Downscaled flow (128x128, float16):    spatial patterns at body scale
+
+The same functions are used by the batched H100 extractor (streaming) and
+by the post-hoc converter (reads full-res .npy via memmap).
 """
 
 from __future__ import annotations
 
-import logging
 from pathlib import Path
 
 import cv2
 import numpy as np
 
-logger = logging.getLogger(__name__)
-
 
 def compute_magnitude_timeseries(flow: np.ndarray) -> np.ndarray:
-    """Compute per-frame flow magnitude statistics.
+    """Per-frame flow magnitude statistics.
 
     Args:
         flow: [N, H, W, 2] flow field (memmap-compatible).
 
     Returns:
-        [N, 6] array: mean, max, std, median, p5, p95 of magnitude per frame.
+        [N, 6] float32 array: mean, max, std, median, p5, p95 of magnitude per frame.
     """
     n_frames = flow.shape[0]
     stats = np.empty((n_frames, 6), dtype=np.float32)
@@ -45,13 +48,13 @@ def compute_magnitude_timeseries(flow: np.ndarray) -> np.ndarray:
 
 
 def compute_spatial_summary(flow: np.ndarray) -> np.ndarray:
-    """Compute per-frame spatial features from flow field.
+    """Per-frame spatial features from flow field.
 
     Args:
         flow: [N, H, W, 2] flow field.
 
     Returns:
-        [N, 12] array per frame:
+        [N, 12] float32 array per frame:
           [0:4]  — quadrant mean magnitudes (TL, TR, BL, BR)
           [4]    — symmetry index (left/right energy ratio)
           [5]    — mean curl (rotation)
@@ -149,24 +152,22 @@ def save_compact_representation(
         stem: Video stem name.
         target_size: Spatial size for downscaled flow.
     """
+    import logging
+    logger = logging.getLogger(__name__)
+
     output_dir.mkdir(parents=True, exist_ok=True)
 
     flow = np.load(str(flow_path), mmap_mode="r")
     logger.info("  compact: %s — %s", stem, flow.shape)
 
-    # 1. Magnitude time series [N, 6]
     mag_ts = compute_magnitude_timeseries(flow)
     np.save(output_dir / f"{stem}_mag_ts.npy", mag_ts)
 
-    # 2. Spatial summary [N, 12]
     spatial = compute_spatial_summary(flow)
     np.save(output_dir / f"{stem}_spatial.npy", spatial)
 
-    # 3. Downscaled flow [N, 128, 128, 2] float16
     small_flow = downscale_flow(flow, target_size)
     np.save(output_dir / f"{stem}_flow128.npy", small_flow)
 
-    size_mb = (
-        mag_ts.nbytes + spatial.nbytes + small_flow.nbytes
-    ) / 1e6
+    size_mb = (mag_ts.nbytes + spatial.nbytes + small_flow.nbytes) / 1e6
     logger.info("  compact saved: %.1f MB", size_mb)

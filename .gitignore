@@ -6,6 +6,16 @@ __pycache__/
 .venv/
 venv*/
 trecvit_env/
+# Catches virtualenvs regardless of directory name (repo once had one
+# named Nmotion/, which the venv*/ glob misses)
+pyvenv.cfg
+/Nmotion/
+
+# Test/build caches
+.pytest_cache/
+
+# Claude Code local state
+.claude/
 
 # Model weights
 *.pt

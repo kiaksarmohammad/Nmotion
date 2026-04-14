@@ -103,9 +103,21 @@ def plot_flow_magnitude_kde(
 # ---------------------------------------------------------------------------
 
 def plot_multiscale_entropy(df: pd.DataFrame, output_dir: Path) -> None:
-    """Entropy vs. scale per group with SEM error bands."""
-    mse_cols = [c for c in df.columns if c.startswith("mse_scale_")]
-    scales = list(range(1, len(mse_cols) + 1))
+    """Entropy vs. scale per group with SEM error bands.
+
+    Parses the actual scale number from each column name so sparse grids
+    (e.g. feature_battery's 1,5,10,15,20) plot at the correct x-positions.
+    """
+    mse_cols_unsorted = [c for c in df.columns if c.startswith("mse_scale_")]
+    if not mse_cols_unsorted:
+        logger.warning("No mse_scale_* columns found; skipping multiscale entropy plot")
+        return
+
+    def _scale_num(col: str) -> int:
+        return int(col.split("_")[-1])
+
+    mse_cols = sorted(mse_cols_unsorted, key=_scale_num)
+    scales = [_scale_num(c) for c in mse_cols]
     groups = _groups_in_order(df)
 
     fig, ax = plt.subplots(figsize=(8, 5))
@@ -123,7 +135,7 @@ def plot_multiscale_entropy(df: pd.DataFrame, output_dir: Path) -> None:
     ax.set_ylabel("Sample Entropy")
     ax.set_title("Multiscale Entropy Profiles")
     ax.legend()
-    ax.set_xticks(scales[::2])
+    ax.set_xticks(scales)
 
     _save_fig(fig, output_dir, "02_multiscale_entropy")
 
