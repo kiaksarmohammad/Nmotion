@@ -1,0 +1,10 @@
+id,source,page_url,video_url,tier,label,subtype,backend,status,local_path,notes,duration_s,resolution,error
+ilae_seizure_01,epilepsydiagnosis.org,https://www.epilepsydiagnosis.org/seizure/neonatal-seizure-overview.html,,B,seizure,neonatal_overview,ilae_cookie,proposed,,Overview page; may link to multiple clips,,,
+ilae_seizure_02,epilepsydiagnosis.org,https://www.epilepsydiagnosis.org/syndrome/self-limited-neonatal-videos.html,,B,seizure,selne,ilae_cookie,proposed,,Self-limited (familial) neonatal epilepsy; focal motor seizures,,,
+ilae_seizure_03,epilepsydiagnosis.org,https://www.epilepsydiagnosis.org/syndrome/mei-overview.html,,B,seizure,mei,ilae_cookie,proposed,,Myoclonic epilepsy in infancy,,,
+ilae_seizure_04,epilepsydiagnosis.org,https://www.epilepsydiagnosis.org/syndrome/infancy-migrating-focal-videos.html,,B,seizure,eimfs,ilae_cookie,proposed,,Epilepsy of infancy with migrating focal seizures,,,
+ilae_seizure_05,epilepsydiagnosis.org,https://www.epilepsydiagnosis.org/syndrome/west-syndrome-overview.html,,B,seizure,iess_west,ilae_cookie,proposed,,Infantile epileptic spasms syndrome; onset often neonatal-early infancy,,,
+ilae_seizure_06,epilepsydiagnosis.org,https://www.epilepsydiagnosis.org/seizure/myoclonic-videos.html,,B,seizure,myoclonic_general,ilae_cookie,proposed,,General myoclonic; filter to neonatal clips post-download,,,
+ilae_imitators_01,epilepsydiagnosis.org,https://www.epilepsydiagnosis.org/epilepsy-imitators.html,,B,normal,nonepileptic_mimics,ilae_cookie,proposed,,Epilepsy imitators; may include normal-variant movements mislabeled as seizure,,,
+pmc_seizure_01,pmc.ncbi.nlm.nih.gov,https://pmc.ncbi.nlm.nih.gov/articles/PMC9221774/,,A,seizure,subtle_ncs,pmc_supp,failed,,Videos S1 (subtle seizure) and S2 (non-convulsive); 28.9MB supp zip,,,File is not a zip file
+zenodo_babypose,zenodo.org,https://zenodo.org/records/3891404,https://zenodo.org/records/3891404/files/BabyPose.zip?download=1,A,normal,preterm_nicu_depth,zenodo_zip,proposed,,DEPTH images only (not RGB video); preterm NICU; requires pipeline adaptation — likely REJECT,,,
