@@ -32,3 +32,6 @@ logs
 # Video data (large files, not tracked)
 data/videos/
 mltrainingdata/
+
+# Markdown (project notes/plans kept local, not in repo)
+*.md
